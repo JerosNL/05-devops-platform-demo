@@ -43,4 +43,3 @@ def test_divide_by_zero(client):
     response = client.get("/divide?a=5&b=0")
     assert response.status_code == 400
     assert "error" in response.json
-    
