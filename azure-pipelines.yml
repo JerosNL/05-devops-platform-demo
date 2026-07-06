@@ -1,0 +1,176 @@
+trigger:
+  - main
+
+pool:
+  name: Default
+
+variables:
+  - name: registry
+    value: 'ghcr.io'
+  - name: imageName
+    value: 'jerosnl/calculator-api'
+  - name: imageTag
+    value: '$(Build.BuildId)'
+  - name: clusterName
+    value: 'aks-platform-jh'
+  - name: resourceGroup
+    value: 'rg-platform-demo'
+  - name: workingDirectory
+    value: '$(System.DefaultWorkingDirectory)/terraform'
+  - group: docker-secrets
+
+stages:
+  - stage: CI
+    displayName: 'CI - Test and lint'
+    jobs:
+      - job: Test
+        displayName: 'Run tests and lint'
+        steps:
+          - script: |
+              pip install -r requirements.txt
+            displayName: 'Install dependencies'
+
+          - script: |
+              python -m flake8 src/ tests/ --max-line-length=88
+            displayName: 'Lint with flake8'
+
+          - script: |
+              python -m pytest tests/ --junitxml=junit/test-results.xml --cov=src --cov-report=xml
+            displayName: 'Run tests with coverage'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFiles: 'junit/test-results.xml'
+              testRunTitle: 'Python Tests'
+            condition: succeededOrFailed()
+            displayName: 'Publish test results'
+
+          - task: PublishCodeCoverageResults@2
+            inputs:
+              summaryFileLocation: '$(System.DefaultWorkingDirectory)/coverage.xml'
+            displayName: 'Publish code coverage'
+
+  - stage: Build
+    displayName: 'Build and push Docker image'
+    dependsOn: CI
+    jobs:
+      - job: DockerBuild
+        displayName: 'Build and push'
+        steps:
+          - script: |
+              docker build -t $(registry)/$(imageName):$(imageTag) -t $(registry)/$(imageName):latest .
+            displayName: 'Build image'
+
+          - script: |
+              echo $(GITHUB_TOKEN) | docker login $(registry) -u JerosNL --password-stdin
+              docker push $(registry)/$(imageName):$(imageTag)
+              docker push $(registry)/$(imageName):latest
+            displayName: 'Push image'
+
+  - stage: Provision
+    displayName: 'Provision AKS with Terraform'
+    dependsOn: Build
+    jobs:
+      - job: TerraformApply
+        displayName: 'Terraform apply'
+        steps:
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: 'latest'
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(workingDirectory)'
+              backendServiceArm: 'azure-lab-portfolio'
+              backendAzureRmResourceGroupName: 'rg-tfstate-demo'
+              backendAzureRmStorageAccountName: 'sttfstatejh01'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'platform-terraform.tfstate'
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(workingDirectory)'
+              environmentServiceNameAzureRM: 'azure-lab-portfolio'
+
+  - stage: Deploy
+    displayName: 'Deploy to AKS'
+    dependsOn: Provision
+    jobs:
+      - job: KubernetesDeploy
+        displayName: 'Deploy and verify'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Get AKS credentials'
+            inputs:
+              azureSubscription: 'azure-lab-portfolio'
+              scriptType: 'batch'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az aks get-credentials --resource-group $(resourceGroup) --name $(clusterName) --overwrite-existing
+
+          - script: |
+              kubectl apply -f k8s/deployment.yaml
+              kubectl apply -f k8s/service.yaml
+            displayName: 'Apply Kubernetes manifests'
+
+          - script: |
+              kubectl rollout status deployment/calculator-api --timeout=300s
+            displayName: 'Wait for deployment'
+
+          - task: AzureCLI@2
+            displayName: 'Smoke test'
+            inputs:
+              azureSubscription: 'azure-lab-portfolio'
+              scriptType: 'batch'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                for /L %%i in (1,1,10) do (
+                  for /f "tokens=*" %%j in ('kubectl get service calculator-api -o jsonpath^="{.status.loadBalancer.ingress[0].ip}"') do set IP=%%j
+                  if not "!IP!"=="" goto :found
+                  echo Waiting for external IP... attempt %%i
+                  timeout /T 30 /NOBREAK
+                )
+                :found
+                echo External IP: !IP!
+                curl -f http://!IP!/health
+            displayName: 'Smoke test - verify health endpoint'
+
+  - stage: Destroy
+    displayName: 'Destroy AKS cluster'
+    dependsOn: Deploy
+    condition: always()
+    jobs:
+      - job: TerraformDestroy
+        displayName: 'Terraform destroy'
+        steps:
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: 'latest'
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(workingDirectory)'
+              backendServiceArm: 'azure-lab-portfolio'
+              backendAzureRmResourceGroupName: 'rg-tfstate-demo'
+              backendAzureRmStorageAccountName: 'sttfstatejh01'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'platform-terraform.tfstate'
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform destroy'
+            inputs:
+              provider: 'azurerm'
+              command: 'destroy'
+              workingDirectory: '$(workingDirectory)'
+              environmentServiceNameAzureRM: 'azure-lab-portfolio'
