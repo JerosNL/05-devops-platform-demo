@@ -125,12 +125,13 @@ stages:
             displayName: 'Wait for deployment'
 
           - task: AzureCLI@2
-            displayName: 'Smoke test'
+            displayName: 'Smoke test - verify health endpoint'
             inputs:
               azureSubscription: 'azure-lab-portfolio'
               scriptType: 'batch'
               scriptLocation: 'inlineScript'
               inlineScript: |
+                setlocal enabledelayedexpansion
                 for /L %%i in (1,1,10) do (
                   for /f "tokens=*" %%j in ('kubectl get service calculator-api -o jsonpath^="{.status.loadBalancer.ingress[0].ip}"') do set IP=%%j
                   if not "!IP!"=="" goto :found
@@ -140,7 +141,6 @@ stages:
                 :found
                 echo External IP: !IP!
                 curl -f http://!IP!/health
-            displayName: 'Smoke test - verify health endpoint'
 
   - stage: Destroy
     displayName: 'Destroy AKS cluster'
